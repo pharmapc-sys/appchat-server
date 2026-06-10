@@ -10,8 +10,12 @@
  *  - {t:"find", phone} looks a user up by phone number (the only discovery mechanism).
  *  - {t:"msg", to, mid, text, ts} sends a private message; it is persisted with a
  *    monotonic `seq` and delivered ONLY to the sender's and recipient's sockets.
+ *    Media messages add kind ("img"/"voice"), data (base64) and dur (seconds).
+ *  - {t:"recv", mid} / {t:"read", peer} are delivery/read receipts; the sender's
+ *    sockets get {t:"status", mid, status} (2 = delivered, 3 = read).
  *  - {t:"hello", since} replays every message involving this user with seq > since,
- *    so history is synchronised after being offline.
+ *    so history is synchronised after being offline, then the latest receipt
+ *    statuses of the user's own messages.
  *  - {t:"fcm", token} stores the device's FCM push token. When a message arrives for a
  *    user with no open socket, an empty high-priority "wake up" push is sent (the
  *    message content never goes through Google); the app then fetches from us.
@@ -148,13 +152,19 @@ async function pgStorage() {
       text     TEXT NOT NULL,
       ts       BIGINT NOT NULL
     )`);
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'");
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS data TEXT NOT NULL DEFAULT ''");
+  await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS dur INT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS status INT NOT NULL DEFAULT 1');
   const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm FROM users')).rows
     .map((r) => ({ ...r, created: Number(r.created) }));
   const messages = (await pool.query(
-    'SELECT seq, mid, from_uid, to_uid, text, ts FROM messages ORDER BY seq'
+    'SELECT seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status FROM messages ORDER BY seq'
   )).rows.map((r) => ({
     from: r.from_uid, to: r.to_uid, mid: r.mid, text: r.text,
     ts: Number(r.ts), seq: Number(r.seq),
+    kind: r.kind || 'text', data: r.data || '', dur: Number(r.dur) || 0,
+    status: Number(r.status) || 1,
   }));
   return {
     kind: `postgres (${new URL(DATABASE_URL).hostname})`,
@@ -170,10 +180,16 @@ async function pgStorage() {
     },
     appendMessage(e) {
       pool.query(
-        `INSERT INTO messages (seq, mid, from_uid, to_uid, text, ts)
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (mid) DO NOTHING`,
-        [e.seq, e.mid, e.from, e.to, e.text, e.ts]
+        `INSERT INTO messages (seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (mid) DO NOTHING`,
+        [e.seq, e.mid, e.from, e.to, e.text, e.ts, e.kind, e.data, e.dur, e.status]
       ).catch((err) => console.error('pg insert failed:', err.message));
+    },
+    updateStatus(mid, status) {
+      pool.query(
+        'UPDATE messages SET status = $2 WHERE mid = $1 AND status < $2',
+        [mid, status]
+      ).catch((err) => console.error('pg status failed:', err.message));
     },
   };
 }
@@ -192,14 +208,31 @@ function fileStorage() {
   };
   const byUid = new Map();
   for (const u of readJsonl(USERS_FILE)) byUid.set(u.uid, u);
+  // Status updates are appended as {smid, status} patch lines, applied on load.
+  const messages = [];
+  const byMid = new Map();
+  for (const rec of readJsonl(MSG_FILE)) {
+    if (rec.smid) {
+      const m = byMid.get(rec.smid);
+      if (m && rec.status > (m.status || 1)) m.status = rec.status;
+    } else {
+      rec.kind = rec.kind || 'text';
+      rec.data = rec.data || '';
+      rec.dur = rec.dur || 0;
+      rec.status = rec.status || 1;
+      messages.push(rec);
+      byMid.set(rec.mid, rec);
+    }
+  }
   const usersOut = fs.createWriteStream(USERS_FILE, { flags: 'a' });
   const msgOut = fs.createWriteStream(MSG_FILE, { flags: 'a' });
   return {
     kind: `files (${path.dirname(MSG_FILE)})`,
     users: [...byUid.values()],
-    messages: readJsonl(MSG_FILE),
+    messages,
     saveUser(u) { usersOut.write(JSON.stringify(u) + '\n'); },
     appendMessage(e) { msgOut.write(JSON.stringify(e) + '\n'); },
+    updateStatus(mid, status) { msgOut.write(JSON.stringify({ smid: mid, status }) + '\n'); },
   };
 }
 
@@ -238,6 +271,8 @@ async function main() {
     return {
       t: 'msg', from: e.from, fromName: users.get(e.from)?.username || '?',
       to: e.to, mid: e.mid, text: e.text, ts: e.ts, seq: e.seq,
+      kind: e.kind || 'text', data: e.data || '', dur: e.dur || 0,
+      status: e.status || 1,
     };
   }
 
@@ -344,6 +379,37 @@ async function main() {
         for (const e of log) {
           if (e.seq > since && (e.from === ws.uid || e.to === ws.uid)) send(ws, wire(e));
         }
+        // Receipts that may have arrived while this user was offline: replay the
+        // statuses of their own recent messages (the app keeps the highest value).
+        let sent = 0;
+        for (let i = log.length - 1; i >= 0 && sent < 300; i--) {
+          const e = log[i];
+          if (e.from !== ws.uid || (e.status || 1) <= 1) continue;
+          send(ws, { t: 'status', mid: e.mid, status: e.status });
+          sent += 1;
+        }
+        return;
+      }
+
+      // Delivery receipt: the recipient's device received this message.
+      if (m.t === 'recv') {
+        const e = log.find((x) => x.mid === String(m.mid || ''));
+        if (!e || e.to !== ws.uid || (e.status || 1) >= 2) return;
+        e.status = 2;
+        db.updateStatus(e.mid, 2);
+        deliver(e.from, { t: 'status', mid: e.mid, status: 2 });
+        return;
+      }
+
+      // Read receipt: every message from [peer] to this user has been seen.
+      if (m.t === 'read') {
+        const peer = String(m.peer || '');
+        for (const e of log) {
+          if (e.from !== peer || e.to !== ws.uid || (e.status || 1) >= 3) continue;
+          e.status = 3;
+          db.updateStatus(e.mid, 3);
+          deliver(peer, { t: 'status', mid: e.mid, status: 3 });
+        }
         return;
       }
 
@@ -371,6 +437,9 @@ async function main() {
         const to = String(m.to || '');
         const mid = String(m.mid || '');
         if (!mid || !users.has(to)) return;
+        const kind = ['text', 'img', 'voice'].includes(m.kind) ? m.kind : 'text';
+        const data = kind === 'text' ? '' : String(m.data || '');
+        if (data.length > 3_000_000) return; // ~2.2 MB binary: refuse oversized media
         // Already stored: just echo it back so the sender can mark it delivered.
         if (seenMids.has(mid)) {
           const existing = log.find((e) => e.mid === mid);
@@ -385,6 +454,10 @@ async function main() {
           text: String(m.text || ''),
           ts: Number(m.ts) || Date.now(),
           seq,
+          kind,
+          data,
+          dur: Math.max(0, Number(m.dur) || 0),
+          status: 1,
         };
         log.push(entry);
         seenMids.add(mid);
