@@ -11,3 +11,6 @@ services:
       # Paste your free Neon/Supabase Postgres connection string in the dashboard.
       - key: DATABASE_URL
         sync: false
+      # Optional: Firebase service-account JSON (one line) to enable push wake-ups.
+      - key: FCM_SERVICE_ACCOUNT
+        sync: false

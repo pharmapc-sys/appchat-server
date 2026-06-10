@@ -12,6 +12,10 @@
  *    monotonic `seq` and delivered ONLY to the sender's and recipient's sockets.
  *  - {t:"hello", since} replays every message involving this user with seq > since,
  *    so history is synchronised after being offline.
+ *  - {t:"fcm", token} stores the device's FCM push token. When a message arrives for a
+ *    user with no open socket, an empty high-priority "wake up" push is sent (the
+ *    message content never goes through Google); the app then fetches from us.
+ *    Requires the FCM_SERVICE_ACCOUNT env var (Firebase service-account JSON).
  *
  * Persistence: Postgres when DATABASE_URL is set (free tiers of Neon/Supabase work),
  * otherwise newline-delimited JSON files next to this script.
@@ -53,6 +57,68 @@ function checkPass(pass, stored) {
   return crypto.timingSafeEqual(h, Buffer.from(hash, 'hex'));
 }
 
+// --- FCM push (optional) ---
+
+const FCM_SA = (() => {
+  if (!process.env.FCM_SERVICE_ACCOUNT) return null;
+  try { return JSON.parse(process.env.FCM_SERVICE_ACCOUNT); }
+  catch (e) { console.error('FCM_SERVICE_ACCOUNT is not valid JSON:', e.message); return null; }
+})();
+
+let fcmAccess = { token: null, exp: 0 };
+
+/** OAuth2 access token for the FCM v1 API (RS256 JWT signed with the service account). */
+async function fcmAccessToken() {
+  if (fcmAccess.token && Date.now() < fcmAccess.exp - 60_000) return fcmAccess.token;
+  const b64 = (s) => Buffer.from(s).toString('base64url');
+  const now = Math.floor(Date.now() / 1000);
+  const header = b64(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = b64(JSON.stringify({
+    iss: FCM_SA.client_email,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  }));
+  const sig = crypto.createSign('RSA-SHA256')
+    .update(`${header}.${claims}`).sign(FCM_SA.private_key).toString('base64url');
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}` +
+      `&assertion=${header}.${claims}.${sig}`,
+  });
+  if (!res.ok) throw new Error(`oauth ${res.status}: ${await res.text()}`);
+  const json = await res.json();
+  fcmAccess = { token: json.access_token, exp: Date.now() + json.expires_in * 1000 };
+  return fcmAccess.token;
+}
+
+/**
+ * Empty data-only push: just wakes the app, which fetches the messages from us.
+ * Returns 'gone' when the token is no longer valid so the caller can drop it.
+ */
+async function fcmWake(deviceToken) {
+  const access = await fcmAccessToken();
+  const res = await fetch(
+    `https://fcm.googleapis.com/v1/projects/${FCM_SA.project_id}/messages:send`,
+    {
+      method: 'POST',
+      headers: { authorization: `Bearer ${access}`, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        message: {
+          token: deviceToken,
+          data: { t: 'wake' },
+          android: { priority: 'HIGH' },
+        },
+      }),
+    }
+  );
+  if (res.status === 404 || res.status === 410) return 'gone';
+  if (!res.ok) console.error(`fcm send failed (${res.status}): ${await res.text()}`);
+  return 'ok';
+}
+
 // --- storage backends ---
 
 /** Postgres-backed storage (free tier of Neon/Supabase is enough). */
@@ -72,6 +138,7 @@ async function pgStorage() {
       token    TEXT NOT NULL,
       created  BIGINT NOT NULL
     )`);
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS fcm TEXT');
   await pool.query(`
     CREATE TABLE IF NOT EXISTS messages (
       seq      BIGINT PRIMARY KEY,
@@ -81,7 +148,7 @@ async function pgStorage() {
       text     TEXT NOT NULL,
       ts       BIGINT NOT NULL
     )`);
-  const users = (await pool.query('SELECT uid, username, pass, phone, token, created FROM users')).rows
+  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm FROM users')).rows
     .map((r) => ({ ...r, created: Number(r.created) }));
   const messages = (await pool.query(
     'SELECT seq, mid, from_uid, to_uid, text, ts FROM messages ORDER BY seq'
@@ -95,10 +162,10 @@ async function pgStorage() {
     messages,
     saveUser(u) {
       pool.query(
-        `INSERT INTO users (uid, username, pass, phone, token, created)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5`,
-        [u.uid, u.username, u.pass, u.phone, u.token, u.created]
+        `INSERT INTO users (uid, username, pass, phone, token, created, fcm)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7`,
+        [u.uid, u.username, u.pass, u.phone, u.token, u.created, u.fcm || null]
       ).catch((e) => console.error('pg saveUser failed:', e.message));
     },
     appendMessage(e) {
@@ -177,6 +244,26 @@ async function main() {
   function deliver(uid, payload) {
     const set = sockets.get(uid);
     if (set) for (const ws of set) send(ws, payload);
+  }
+
+  /**
+   * Wake [user]'s phone via FCM. Throttled per user (a burst of messages triggers a
+   * single fetch on the phone anyway); an invalid token is dropped from the account.
+   */
+  const lastPush = new Map(); // uid -> ms timestamp
+  function pushWake(user) {
+    if (!FCM_SA || !user || !user.fcm) return;
+    const now = Date.now();
+    if (now - (lastPush.get(user.uid) || 0) < 15_000) return;
+    lastPush.set(user.uid, now);
+    fcmWake(user.fcm)
+      .then((status) => {
+        if (status === 'gone') {
+          user.fcm = null;
+          db.saveUser(user);
+        }
+      })
+      .catch((e) => console.error('fcm push failed:', e.message));
   }
 
   function attach(ws, user) {
@@ -260,6 +347,16 @@ async function main() {
         return;
       }
 
+      if (m.t === 'fcm') {
+        const token = String(m.token || '');
+        const user = users.get(ws.uid);
+        if (user && token && user.fcm !== token) {
+          user.fcm = token;
+          db.saveUser(user);
+        }
+        return;
+      }
+
       if (m.t === 'find') {
         const phone = normalizePhone(m.phone);
         const found = phone ? byPhone.get(phone) : undefined;
@@ -295,6 +392,8 @@ async function main() {
         const payload = wire(entry);
         deliver(to, payload);
         if (to !== ws.uid) deliver(ws.uid, payload); // echo to all the sender's devices
+        // Recipient has no live connection: wake their phone so it fetches from us.
+        if (to !== ws.uid && !(sockets.get(to)?.size)) pushWake(users.get(to));
         return;
       }
     });
