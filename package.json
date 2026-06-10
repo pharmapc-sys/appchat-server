@@ -1,0 +1,13 @@
+{
+  "name": "appchat-relay",
+  "version": "1.0.0",
+  "description": "Relay server for AppChat P2P — stores and forwards messages over the internet.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "ws": "^8.18.0"
+  }
+}

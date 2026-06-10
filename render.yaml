@@ -1,0 +1,13 @@
+# Render blueprint: deploys the AppChat server on the free plan.
+# In the Render dashboard: New → Blueprint → point it at this repository.
+services:
+  - type: web
+    name: appchat-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      # Paste your free Neon/Supabase Postgres connection string in the dashboard.
+      - key: DATABASE_URL
+        sync: false
