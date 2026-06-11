@@ -164,7 +164,8 @@ async function pgStorage() {
   await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited INT NOT NULL DEFAULT 0');
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT NOT NULL DEFAULT ''");
   await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT NOT NULL DEFAULT 0');
-  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm, avatar, last_seen FROM users')).rows
+  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''");
+  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm, avatar, last_seen, bio FROM users')).rows
     .map((r) => ({ ...r, created: Number(r.created), lastSeen: Number(r.last_seen) || 0 }));
   const messages = (await pool.query(
     'SELECT seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status, reply_to, reply_text, reply_name, reactions, deleted, edited FROM messages ORDER BY seq'
@@ -182,11 +183,11 @@ async function pgStorage() {
     messages,
     saveUser(u) {
       pool.query(
-        `INSERT INTO users (uid, username, pass, phone, token, created, fcm, avatar, last_seen)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7, avatar = $8, last_seen = $9`,
+        `INSERT INTO users (uid, username, pass, phone, token, created, fcm, avatar, last_seen, bio)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7, avatar = $8, last_seen = $9, bio = $10`,
         [u.uid, u.username, u.pass, u.phone, u.token, u.created, u.fcm || null,
-         u.avatar || '', u.lastSeen || 0]
+         u.avatar || '', u.lastSeen || 0, u.bio || '']
       ).catch((e) => console.error('pg saveUser failed:', e.message));
     },
     appendMessage(e) {
@@ -327,6 +328,7 @@ async function main() {
       lastSeen: u?.lastSeen || 0,
       avatar: u?.avatar || '',
       name: u?.username || '',
+      bio: u?.bio || '',
     };
   }
 
@@ -363,7 +365,7 @@ async function main() {
     console.log(`auth ok: ${user.username} (${sockets.get(user.uid).size} socket(s))`);
     send(ws, {
       t: 'auth_ok', uid: user.uid, user: user.username, phone: user.phone,
-      token: user.token, avatar: user.avatar || '',
+      token: user.token, avatar: user.avatar || '', bio: user.bio || '',
     });
     if (fresh) notifyWatchers(user.uid); // just came online
   }
@@ -499,7 +501,7 @@ async function main() {
           t: 'found',
           phone: String(m.phone || ''),
           user: found
-            ? { uid: found.uid, user: found.username, phone: found.phone, avatar: found.avatar || '' }
+            ? { uid: found.uid, user: found.username, phone: found.phone, avatar: found.avatar || '', bio: found.bio || '' }
             : null,
         });
       }
@@ -534,6 +536,17 @@ async function main() {
         const user = users.get(ws.uid);
         if (user) {
           user.avatar = String(m.data || '').slice(0, 200_000);
+          db.saveUser(user);
+          notifyWatchers(ws.uid);
+        }
+        return;
+      }
+
+      // Set my status/bio line. Pushed to anyone watching me.
+      if (m.t === 'bio') {
+        const user = users.get(ws.uid);
+        if (user) {
+          user.bio = String(m.bio || '').slice(0, 140);
           db.saveUser(user);
           notifyWatchers(ws.uid);
         }
