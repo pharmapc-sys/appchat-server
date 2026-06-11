@@ -305,6 +305,7 @@ async function main() {
     ws.uid = user.uid;
     if (!sockets.has(user.uid)) sockets.set(user.uid, new Set());
     sockets.get(user.uid).add(ws);
+    console.log(`auth ok: ${user.username} (${sockets.get(user.uid).size} socket(s))`);
     send(ws, { t: 'auth_ok', uid: user.uid, user: user.username, phone: user.phone, token: user.token });
   }
 
@@ -394,9 +395,15 @@ async function main() {
       // Delivery receipt: the recipient's device received this message.
       if (m.t === 'recv') {
         const e = log.find((x) => x.mid === String(m.mid || ''));
-        if (!e || e.to !== ws.uid || (e.status || 1) >= 2) return;
+        const who = users.get(ws.uid)?.username;
+        if (!e || e.to !== ws.uid || (e.status || 1) >= 2) {
+          console.log(`recv de ${who}: ignoré (inconnu/déjà fait)`);
+          return;
+        }
         e.status = 2;
         db.updateStatus(e.mid, 2);
+        const n = sockets.get(e.from)?.size || 0;
+        console.log(`recv: ${who} a reçu un msg de ${users.get(e.from)?.username} → status 2 (sockets expéditeur: ${n})`);
         deliver(e.from, { t: 'status', mid: e.mid, status: 2 });
         return;
       }
@@ -404,12 +411,15 @@ async function main() {
       // Read receipt: every message from [peer] to this user has been seen.
       if (m.t === 'read') {
         const peer = String(m.peer || '');
+        let n = 0;
         for (const e of log) {
           if (e.from !== peer || e.to !== ws.uid || (e.status || 1) >= 3) continue;
           e.status = 3;
           db.updateStatus(e.mid, 3);
           deliver(peer, { t: 'status', mid: e.mid, status: 3 });
+          n += 1;
         }
+        console.log(`read: ${users.get(ws.uid)?.username} a lu ${n} msg de ${users.get(peer)?.username} (sockets expéditeur: ${sockets.get(peer)?.size || 0})`);
         return;
       }
 
@@ -463,10 +473,12 @@ async function main() {
         seenMids.add(mid);
         db.appendMessage(entry);
         const payload = wire(entry);
+        const rcptSockets = sockets.get(to)?.size || 0;
+        console.log(`msg ${entry.kind} de ${users.get(ws.uid)?.username} → ${users.get(to)?.username} (sockets destinataire: ${rcptSockets})`);
         deliver(to, payload);
         if (to !== ws.uid) deliver(ws.uid, payload); // echo to all the sender's devices
         // Recipient has no live connection: wake their phone so it fetches from us.
-        if (to !== ws.uid && !(sockets.get(to)?.size)) pushWake(users.get(to));
+        if (to !== ws.uid && !rcptSockets) pushWake(users.get(to));
         return;
       }
     });
