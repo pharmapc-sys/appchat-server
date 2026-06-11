@@ -165,10 +165,13 @@ async function pgStorage() {
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT NOT NULL DEFAULT ''");
   await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT NOT NULL DEFAULT 0');
   await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT NOT NULL DEFAULT ''");
-  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm, avatar, last_seen, bio FROM users')).rows
+  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pubkey TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS wrap_to TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS wrap_self TEXT NOT NULL DEFAULT ''");
+  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm, avatar, last_seen, bio, pubkey FROM users')).rows
     .map((r) => ({ ...r, created: Number(r.created), lastSeen: Number(r.last_seen) || 0 }));
   const messages = (await pool.query(
-    'SELECT seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status, reply_to, reply_text, reply_name, reactions, deleted, edited FROM messages ORDER BY seq'
+    'SELECT seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status, reply_to, reply_text, reply_name, reactions, deleted, edited, wrap_to, wrap_self FROM messages ORDER BY seq'
   )).rows.map((r) => ({
     from: r.from_uid, to: r.to_uid, mid: r.mid, text: r.text,
     ts: Number(r.ts), seq: Number(r.seq),
@@ -176,6 +179,7 @@ async function pgStorage() {
     status: Number(r.status) || 1,
     replyTo: r.reply_to || '', replyText: r.reply_text || '', replyName: r.reply_name || '',
     reactions: r.reactions || '', deleted: Number(r.deleted) || 0, edited: Number(r.edited) || 0,
+    wrapTo: r.wrap_to || '', wrapSelf: r.wrap_self || '',
   }));
   return {
     kind: `postgres (${new URL(DATABASE_URL).hostname})`,
@@ -183,21 +187,21 @@ async function pgStorage() {
     messages,
     saveUser(u) {
       pool.query(
-        `INSERT INTO users (uid, username, pass, phone, token, created, fcm, avatar, last_seen, bio)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7, avatar = $8, last_seen = $9, bio = $10`,
+        `INSERT INTO users (uid, username, pass, phone, token, created, fcm, avatar, last_seen, bio, pubkey)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7, avatar = $8, last_seen = $9, bio = $10, pubkey = $11`,
         [u.uid, u.username, u.pass, u.phone, u.token, u.created, u.fcm || null,
-         u.avatar || '', u.lastSeen || 0, u.bio || '']
+         u.avatar || '', u.lastSeen || 0, u.bio || '', u.pubkey || '']
       ).catch((e) => console.error('pg saveUser failed:', e.message));
     },
     appendMessage(e) {
       pool.query(
         `INSERT INTO messages
            (seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status,
-            reply_to, reply_text, reply_name)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (mid) DO NOTHING`,
+            reply_to, reply_text, reply_name, wrap_to, wrap_self)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT (mid) DO NOTHING`,
         [e.seq, e.mid, e.from, e.to, e.text, e.ts, e.kind, e.data, e.dur, e.status,
-         e.replyTo || '', e.replyText || '', e.replyName || '']
+         e.replyTo || '', e.replyText || '', e.replyName || '', e.wrapTo || '', e.wrapSelf || '']
       ).catch((err) => console.error('pg insert failed:', err.message));
     },
     updateStatus(mid, status) {
@@ -208,8 +212,9 @@ async function pgStorage() {
     },
     patchMessage(e) {
       pool.query(
-        'UPDATE messages SET text=$2, data=$3, reactions=$4, deleted=$5, edited=$6 WHERE mid=$1',
-        [e.mid, e.text, e.data, e.reactions || '', e.deleted || 0, e.edited || 0]
+        'UPDATE messages SET text=$2, data=$3, reactions=$4, deleted=$5, edited=$6, wrap_to=$7, wrap_self=$8 WHERE mid=$1',
+        [e.mid, e.text, e.data, e.reactions || '', e.deleted || 0, e.edited || 0,
+         e.wrapTo || '', e.wrapSelf || '']
       ).catch((err) => console.error('pg patch failed:', err.message));
     },
   };
@@ -248,6 +253,8 @@ function fileStorage() {
       rec.reactions = rec.reactions || '';
       rec.deleted = rec.deleted || 0;
       rec.edited = rec.edited || 0;
+      rec.wrapTo = rec.wrapTo || '';
+      rec.wrapSelf = rec.wrapSelf || '';
       messages.push(rec);
       byMid.set(rec.mid, rec);
     }
@@ -264,7 +271,10 @@ function fileStorage() {
     patchMessage(e) {
       msgOut.write(JSON.stringify({
         patch: e.mid,
-        fields: { text: e.text, data: e.data, reactions: e.reactions, deleted: e.deleted, edited: e.edited },
+        fields: {
+          text: e.text, data: e.data, reactions: e.reactions, deleted: e.deleted,
+          edited: e.edited, wrapTo: e.wrapTo, wrapSelf: e.wrapSelf,
+        },
       }) + '\n');
     },
   };
@@ -309,6 +319,7 @@ async function main() {
       status: e.status || 1,
       replyTo: e.replyTo || '', replyText: e.replyText || '', replyName: e.replyName || '',
       reactions: e.reactions || '', deleted: e.deleted || 0, edited: e.edited || 0,
+      wrapTo: e.wrapTo || '', wrapSelf: e.wrapSelf || '',
     };
   }
 
@@ -329,6 +340,7 @@ async function main() {
       avatar: u?.avatar || '',
       name: u?.username || '',
       bio: u?.bio || '',
+      pubkey: u?.pubkey || '',
     };
   }
 
@@ -366,6 +378,7 @@ async function main() {
     send(ws, {
       t: 'auth_ok', uid: user.uid, user: user.username, phone: user.phone,
       token: user.token, avatar: user.avatar || '', bio: user.bio || '',
+      pubkey: user.pubkey || '',
     });
     if (fresh) notifyWatchers(user.uid); // just came online
   }
@@ -501,7 +514,7 @@ async function main() {
           t: 'found',
           phone: String(m.phone || ''),
           user: found
-            ? { uid: found.uid, user: found.username, phone: found.phone, avatar: found.avatar || '', bio: found.bio || '' }
+            ? { uid: found.uid, user: found.username, phone: found.phone, avatar: found.avatar || '', bio: found.bio || '', pubkey: found.pubkey || '' }
             : null,
         });
       }
@@ -542,6 +555,17 @@ async function main() {
         return;
       }
 
+      // Publish my E2E public key. Pushed to anyone watching me so they can encrypt.
+      if (m.t === 'pubkey') {
+        const user = users.get(ws.uid);
+        if (user) {
+          user.pubkey = String(m.pubkey || '').slice(0, 500);
+          db.saveUser(user);
+          notifyWatchers(ws.uid);
+        }
+        return;
+      }
+
       // Set my status/bio line. Pushed to anyone watching me.
       if (m.t === 'bio') {
         const user = users.get(ws.uid);
@@ -568,14 +592,23 @@ async function main() {
         return;
       }
 
-      // Edit one of my own text messages.
+      // Edit one of my own text messages (plain or encrypted).
       if (m.t === 'edit') {
         const e = log.find((x) => x.mid === String(m.mid || ''));
-        if (!e || e.from !== ws.uid || e.deleted || e.kind !== 'text') return;
-        e.text = String(m.text || '');
+        if (!e || e.from !== ws.uid || e.deleted) return;
+        if (e.kind === 'enc') {
+          e.data = String(m.data || '');
+          e.wrapTo = String(m.wrapTo || '');
+          e.wrapSelf = String(m.wrapSelf || '');
+        } else if (e.kind === 'text') {
+          e.text = String(m.text || '');
+        } else return;
         e.edited = 1;
         db.patchMessage(e);
-        const payload = { t: 'edit', mid: e.mid, text: e.text };
+        const payload = {
+          t: 'edit', mid: e.mid, text: e.text,
+          data: e.data, wrapTo: e.wrapTo, wrapSelf: e.wrapSelf,
+        };
         deliver(e.from, payload);
         if (e.to !== e.from) deliver(e.to, payload);
         return;
@@ -597,9 +630,9 @@ async function main() {
         const to = String(m.to || '');
         const mid = String(m.mid || '');
         if (!mid || !users.has(to)) return;
-        const kind = ['text', 'img', 'voice', 'file', 'loc', 'video'].includes(m.kind) ? m.kind : 'text';
+        const kind = ['text', 'img', 'voice', 'file', 'loc', 'video', 'enc'].includes(m.kind) ? m.kind : 'text';
         const data = kind === 'text' ? '' : String(m.data || '');
-        if (data.length > 8_000_000) return; // ~6 MB binary: refuse oversized media
+        if (data.length > 11_000_000) return; // refuse oversized payloads (encryption adds ~35%)
         // Already stored: just echo it back so the sender can mark it delivered.
         if (seenMids.has(mid)) {
           const existing = log.find((e) => e.mid === mid);
@@ -624,6 +657,8 @@ async function main() {
           reactions: '',
           deleted: 0,
           edited: 0,
+          wrapTo: String(m.wrapTo || ''),
+          wrapSelf: String(m.wrapSelf || ''),
         };
         log.push(entry);
         seenMids.add(mid);
@@ -661,6 +696,26 @@ async function main() {
     `AppChat private relay on ws://0.0.0.0:${PORT}  ` +
     `(storage: ${db.kind}, ${users.size} users, ${log.length} messages)`
   );
+
+  // --- periodic media cleanup: free the database by dropping old media payloads ---
+  // Photos/videos/voice/files older than this lose their data blob (the message row
+  // and its text stay; clients show "média expiré"). Text messages are untouched.
+  const MEDIA_TTL_MS = Number(process.env.MEDIA_TTL_DAYS || 60) * 24 * 3600 * 1000;
+  const MEDIA_KINDS = new Set(['img', 'voice', 'video', 'file', 'loc']);
+  function purgeOldMedia() {
+    const cutoff = Date.now() - MEDIA_TTL_MS;
+    let n = 0;
+    for (const e of log) {
+      if (MEDIA_KINDS.has(e.kind) && e.data && e.ts < cutoff) {
+        e.data = ''; e.purged = 1;
+        db.patchMessage(e);
+        n += 1;
+      }
+    }
+    if (n > 0) console.log(`media cleanup: purged ${n} old media payload(s)`);
+  }
+  purgeOldMedia();
+  setInterval(purgeOldMedia, 6 * 3600 * 1000); // every 6 hours
 }
 
 main().catch((err) => {
