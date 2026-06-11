@@ -156,15 +156,25 @@ async function pgStorage() {
   await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS data TEXT NOT NULL DEFAULT ''");
   await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS dur INT NOT NULL DEFAULT 0');
   await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS status INT NOT NULL DEFAULT 1');
-  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm FROM users')).rows
-    .map((r) => ({ ...r, created: Number(r.created) }));
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_text TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_name TEXT NOT NULL DEFAULT ''");
+  await pool.query("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions TEXT NOT NULL DEFAULT ''");
+  await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted INT NOT NULL DEFAULT 0');
+  await pool.query('ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited INT NOT NULL DEFAULT 0');
+  await pool.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT NOT NULL DEFAULT ''");
+  await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen BIGINT NOT NULL DEFAULT 0');
+  const users = (await pool.query('SELECT uid, username, pass, phone, token, created, fcm, avatar, last_seen FROM users')).rows
+    .map((r) => ({ ...r, created: Number(r.created), lastSeen: Number(r.last_seen) || 0 }));
   const messages = (await pool.query(
-    'SELECT seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status FROM messages ORDER BY seq'
+    'SELECT seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status, reply_to, reply_text, reply_name, reactions, deleted, edited FROM messages ORDER BY seq'
   )).rows.map((r) => ({
     from: r.from_uid, to: r.to_uid, mid: r.mid, text: r.text,
     ts: Number(r.ts), seq: Number(r.seq),
     kind: r.kind || 'text', data: r.data || '', dur: Number(r.dur) || 0,
     status: Number(r.status) || 1,
+    replyTo: r.reply_to || '', replyText: r.reply_text || '', replyName: r.reply_name || '',
+    reactions: r.reactions || '', deleted: Number(r.deleted) || 0, edited: Number(r.edited) || 0,
   }));
   return {
     kind: `postgres (${new URL(DATABASE_URL).hostname})`,
@@ -172,17 +182,21 @@ async function pgStorage() {
     messages,
     saveUser(u) {
       pool.query(
-        `INSERT INTO users (uid, username, pass, phone, token, created, fcm)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7`,
-        [u.uid, u.username, u.pass, u.phone, u.token, u.created, u.fcm || null]
+        `INSERT INTO users (uid, username, pass, phone, token, created, fcm, avatar, last_seen)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (uid) DO UPDATE SET pass = $3, token = $5, fcm = $7, avatar = $8, last_seen = $9`,
+        [u.uid, u.username, u.pass, u.phone, u.token, u.created, u.fcm || null,
+         u.avatar || '', u.lastSeen || 0]
       ).catch((e) => console.error('pg saveUser failed:', e.message));
     },
     appendMessage(e) {
       pool.query(
-        `INSERT INTO messages (seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (mid) DO NOTHING`,
-        [e.seq, e.mid, e.from, e.to, e.text, e.ts, e.kind, e.data, e.dur, e.status]
+        `INSERT INTO messages
+           (seq, mid, from_uid, to_uid, text, ts, kind, data, dur, status,
+            reply_to, reply_text, reply_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (mid) DO NOTHING`,
+        [e.seq, e.mid, e.from, e.to, e.text, e.ts, e.kind, e.data, e.dur, e.status,
+         e.replyTo || '', e.replyText || '', e.replyName || '']
       ).catch((err) => console.error('pg insert failed:', err.message));
     },
     updateStatus(mid, status) {
@@ -190,6 +204,12 @@ async function pgStorage() {
         'UPDATE messages SET status = $2 WHERE mid = $1 AND status < $2',
         [mid, status]
       ).catch((err) => console.error('pg status failed:', err.message));
+    },
+    patchMessage(e) {
+      pool.query(
+        'UPDATE messages SET text=$2, data=$3, reactions=$4, deleted=$5, edited=$6 WHERE mid=$1',
+        [e.mid, e.text, e.data, e.reactions || '', e.deleted || 0, e.edited || 0]
+      ).catch((err) => console.error('pg patch failed:', err.message));
     },
   };
 }
@@ -208,18 +228,25 @@ function fileStorage() {
   };
   const byUid = new Map();
   for (const u of readJsonl(USERS_FILE)) byUid.set(u.uid, u);
-  // Status updates are appended as {smid, status} patch lines, applied on load.
+  // Patch lines: {smid, status} for receipts, {patch, ...fields} for edit/del/react.
   const messages = [];
   const byMid = new Map();
   for (const rec of readJsonl(MSG_FILE)) {
     if (rec.smid) {
       const m = byMid.get(rec.smid);
       if (m && rec.status > (m.status || 1)) m.status = rec.status;
+    } else if (rec.patch) {
+      const m = byMid.get(rec.patch);
+      if (m) Object.assign(m, rec.fields);
     } else {
       rec.kind = rec.kind || 'text';
       rec.data = rec.data || '';
       rec.dur = rec.dur || 0;
       rec.status = rec.status || 1;
+      rec.replyTo = rec.replyTo || '';
+      rec.reactions = rec.reactions || '';
+      rec.deleted = rec.deleted || 0;
+      rec.edited = rec.edited || 0;
       messages.push(rec);
       byMid.set(rec.mid, rec);
     }
@@ -233,6 +260,12 @@ function fileStorage() {
     saveUser(u) { usersOut.write(JSON.stringify(u) + '\n'); },
     appendMessage(e) { msgOut.write(JSON.stringify(e) + '\n'); },
     updateStatus(mid, status) { msgOut.write(JSON.stringify({ smid: mid, status }) + '\n'); },
+    patchMessage(e) {
+      msgOut.write(JSON.stringify({
+        patch: e.mid,
+        fields: { text: e.text, data: e.data, reactions: e.reactions, deleted: e.deleted, edited: e.edited },
+      }) + '\n');
+    },
   };
 }
 
@@ -273,12 +306,33 @@ async function main() {
       to: e.to, mid: e.mid, text: e.text, ts: e.ts, seq: e.seq,
       kind: e.kind || 'text', data: e.data || '', dur: e.dur || 0,
       status: e.status || 1,
+      replyTo: e.replyTo || '', replyText: e.replyText || '', replyName: e.replyName || '',
+      reactions: e.reactions || '', deleted: e.deleted || 0, edited: e.edited || 0,
     };
   }
 
   function deliver(uid, payload) {
     const set = sockets.get(uid);
     if (set) for (const ws of set) send(ws, payload);
+  }
+
+  // --- presence: who is online, last-seen, and who is watching whom ---
+  const watchers = new Map(); // watched uid -> Set<ws> interested in its presence
+
+  function presenceOf(uid) {
+    const u = users.get(uid);
+    return {
+      t: 'presence', uid,
+      online: (sockets.get(uid)?.size || 0) > 0,
+      lastSeen: u?.lastSeen || 0,
+      avatar: u?.avatar || '',
+      name: u?.username || '',
+    };
+  }
+
+  function notifyWatchers(uid) {
+    const set = watchers.get(uid);
+    if (set) { const p = presenceOf(uid); for (const ws of set) send(ws, p); }
   }
 
   /**
@@ -303,10 +357,15 @@ async function main() {
 
   function attach(ws, user) {
     ws.uid = user.uid;
+    const fresh = !(sockets.get(user.uid)?.size);
     if (!sockets.has(user.uid)) sockets.set(user.uid, new Set());
     sockets.get(user.uid).add(ws);
     console.log(`auth ok: ${user.username} (${sockets.get(user.uid).size} socket(s))`);
-    send(ws, { t: 'auth_ok', uid: user.uid, user: user.username, phone: user.phone, token: user.token });
+    send(ws, {
+      t: 'auth_ok', uid: user.uid, user: user.username, phone: user.phone,
+      token: user.token, avatar: user.avatar || '',
+    });
+    if (fresh) notifyWatchers(user.uid); // just came online
   }
 
   const wss = new WebSocketServer({ port: PORT });
@@ -439,17 +498,95 @@ async function main() {
         return send(ws, {
           t: 'found',
           phone: String(m.phone || ''),
-          user: found ? { uid: found.uid, user: found.username, phone: found.phone } : null,
+          user: found
+            ? { uid: found.uid, user: found.username, phone: found.phone, avatar: found.avatar || '' }
+            : null,
         });
+      }
+
+      // --- presence: subscribe to a contact's online/last-seen status ---
+      if (m.t === 'watch') {
+        const uid = String(m.uid || '');
+        if (uid) {
+          if (!watchers.has(uid)) watchers.set(uid, new Set());
+          watchers.get(uid).add(ws);
+          (ws.watching || (ws.watching = new Set())).add(uid);
+          send(ws, presenceOf(uid));
+        }
+        return;
+      }
+      if (m.t === 'unwatch') {
+        const uid = String(m.uid || '');
+        watchers.get(uid)?.delete(ws);
+        ws.watching?.delete(uid);
+        return;
+      }
+
+      // Typing indicator: ephemeral, not stored.
+      if (m.t === 'typing') {
+        const to = String(m.to || '');
+        if (users.has(to)) deliver(to, { t: 'typing', from: ws.uid, on: m.on !== false });
+        return;
+      }
+
+      // Set my profile photo (small JPEG, base64). Pushed to anyone watching me.
+      if (m.t === 'avatar') {
+        const user = users.get(ws.uid);
+        if (user) {
+          user.avatar = String(m.data || '').slice(0, 200_000);
+          db.saveUser(user);
+          notifyWatchers(ws.uid);
+        }
+        return;
+      }
+
+      // React to a message with an emoji (empty emoji removes the reaction).
+      if (m.t === 'react') {
+        const e = log.find((x) => x.mid === String(m.mid || ''));
+        if (!e || (e.from !== ws.uid && e.to !== ws.uid)) return;
+        const map = e.reactions ? JSON.parse(e.reactions) : {};
+        const emoji = String(m.emoji || '').slice(0, 8);
+        if (emoji) map[ws.uid] = emoji; else delete map[ws.uid];
+        e.reactions = JSON.stringify(map);
+        db.patchMessage(e);
+        const payload = { t: 'react', mid: e.mid, uid: ws.uid, emoji };
+        deliver(e.from, payload);
+        if (e.to !== e.from) deliver(e.to, payload);
+        return;
+      }
+
+      // Edit one of my own text messages.
+      if (m.t === 'edit') {
+        const e = log.find((x) => x.mid === String(m.mid || ''));
+        if (!e || e.from !== ws.uid || e.deleted || e.kind !== 'text') return;
+        e.text = String(m.text || '');
+        e.edited = 1;
+        db.patchMessage(e);
+        const payload = { t: 'edit', mid: e.mid, text: e.text };
+        deliver(e.from, payload);
+        if (e.to !== e.from) deliver(e.to, payload);
+        return;
+      }
+
+      // Delete one of my own messages for everyone.
+      if (m.t === 'del') {
+        const e = log.find((x) => x.mid === String(m.mid || ''));
+        if (!e || e.from !== ws.uid) return;
+        e.deleted = 1; e.text = ''; e.data = '';
+        db.patchMessage(e);
+        const payload = { t: 'del', mid: e.mid };
+        deliver(e.from, payload);
+        if (e.to !== e.from) deliver(e.to, payload);
+        return;
       }
 
       if (m.t === 'msg') {
         const to = String(m.to || '');
         const mid = String(m.mid || '');
         if (!mid || !users.has(to)) return;
-        const kind = ['text', 'img', 'voice', 'file', 'loc'].includes(m.kind) ? m.kind : 'text';
+        const kind = ['text', 'img', 'voice', 'file', 'loc', 'video'].includes(m.kind) ? m.kind : 'text';
         const data = kind === 'text' ? '' : String(m.data || '');
-        if (data.length > 3_000_000) return; // ~2.2 MB binary: refuse oversized media
+        if (data.length > 8_000_000) return; // ~6 MB binary: refuse oversized media
         // Already stored: just echo it back so the sender can mark it delivered.
         if (seenMids.has(mid)) {
           const existing = log.find((e) => e.mid === mid);
@@ -468,6 +605,12 @@ async function main() {
           data,
           dur: Math.max(0, Number(m.dur) || 0),
           status: 1,
+          replyTo: String(m.replyTo || ''),
+          replyText: String(m.replyText || '').slice(0, 200),
+          replyName: String(m.replyName || '').slice(0, 40),
+          reactions: '',
+          deleted: 0,
+          edited: 0,
         };
         log.push(entry);
         seenMids.add(mid);
@@ -484,7 +627,17 @@ async function main() {
     });
 
     const detach = () => {
-      if (ws.uid) sockets.get(ws.uid)?.delete(ws);
+      // Stop watching others.
+      if (ws.watching) for (const uid of ws.watching) watchers.get(uid)?.delete(ws);
+      if (ws.uid) {
+        sockets.get(ws.uid)?.delete(ws);
+        // Last socket gone: record last-seen and tell watchers we went offline.
+        if (!(sockets.get(ws.uid)?.size)) {
+          const user = users.get(ws.uid);
+          if (user) { user.lastSeen = Date.now(); db.saveUser(user); }
+          notifyWatchers(ws.uid);
+        }
+      }
       console.log(`- conn ${ip}`);
     };
     ws.on('close', detach);
