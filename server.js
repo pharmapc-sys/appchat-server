@@ -447,7 +447,7 @@ async function main() {
         const to = String(m.to || '');
         const mid = String(m.mid || '');
         if (!mid || !users.has(to)) return;
-        const kind = ['text', 'img', 'voice'].includes(m.kind) ? m.kind : 'text';
+        const kind = ['text', 'img', 'voice', 'file', 'loc'].includes(m.kind) ? m.kind : 'text';
         const data = kind === 'text' ? '' : String(m.data || '');
         if (data.length > 3_000_000) return; // ~2.2 MB binary: refuse oversized media
         // Already stored: just echo it back so the sender can mark it delivered.
